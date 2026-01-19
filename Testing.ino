@@ -3,7 +3,7 @@
 #include <WiFiUdp.h>
 
 WiFiUDP udp;
-const char* laptop_ip = "172.20.10.3"; // Replace with your laptop's hotspot IP
+const char* laptop_ip = "172.20.10.14"; // Replace with your laptop's hotspot IP
 const int udp_port = 4210;
 
 // WiFi Credentials
@@ -333,7 +333,7 @@ char handleJunction() {
 
   if (sensorState == 0b11111) {
       if (goalTime == 0) goalTime = millis(); // Start timer
-      if (millis() - goalTime > 300) {         // Check timer
+      if (millis() - goalTime > 50) {         // Check timer
         motor_drive(0, 0);
         send("Goal Reached (in Phase 1)!!");
         start = false;
@@ -354,7 +354,7 @@ char handleJunction() {
     
     if (sensorState == 0b11111) {
       if (goalTime == 0) goalTime = millis(); // Start timer
-      if (millis() - goalTime > 300) {         // Check timer
+      if (millis() - goalTime > 50) {         // Check timer
         motor_drive(0, 0);
         send("Goal Reached (in Phase 1)!!");
         start = false;
@@ -504,7 +504,17 @@ void turn(char move) {
       }
     }
 
+    unsigned long startTime = millis();
+
     while (true) {
+      if (millis() - startTime > 1500) {
+        motor_drive(-50, 50);
+        delay(100);
+        motor_drive(-50, -50);
+        delay(100);
+        startTime = millis();
+      }
+
       calculatePosition();
       if (prevsensorState != sensorState) {
         sendState(sensorState);
@@ -516,7 +526,17 @@ void turn(char move) {
       }
     }
 
+    startTime = millis();
+
     while (true) {
+      if (millis() - startTime > 3000) {
+        motor_drive(-50, 50);
+        delay(50);
+        motor_drive(-50, -50);
+        delay(100);
+        startTime = millis();
+      }
+
       calculatePosition();
       if (prevsensorState != sensorState) {
         sendState(sensorState);
