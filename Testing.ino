@@ -2,6 +2,25 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 
+#include <esp_now.h>
+#include <esp_wifi.h> // Needed to read channel
+
+// --- ESP-NOW VARIABLES ---
+typedef struct struct_message {
+  int x;
+  int y;
+  int button;
+} struct_message;
+
+struct_message incomingData;
+volatile unsigned long lastRecvTime = 0;
+
+// Callback when data is received
+void OnDataRecv(const uint8_t * mac, const uint8_t *incomingDataPtr, int len) {
+  memcpy(&incomingData, incomingDataPtr, sizeof(incomingData));
+  lastRecvTime = millis(); // Record time of reception
+}
+
 WiFiUDP udp;
 const char* laptop_ip = "172.20.10.14"; // Replace with your laptop's hotspot IP
 const int udp_port = 4210;
@@ -84,6 +103,16 @@ void setup() {
   }
 
   Serial.println("\nConnected!");
+  // --- ESP-NOW INIT ---
+  // Note: WiFi is already started by your code above
+  Serial.print("WiFi Channel is: ");
+  Serial.println(WiFi.channel()); // READ THIS and update Joystick code!
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+  }
+  // Register callback
+  esp_now_register_recv_cb(esp_now_recv_cb_t(OnDataRecv));
   send("Connected");
   
   // Motor pins
@@ -155,8 +184,49 @@ void loop() {
 
   }
 
+  //else {
+    //motor_drive(0, 0);
+    //int position = calculatePosition();
+    //if (prevsensorState != sensorState) {
+      //sendState(sensorState);
+      //prevsensorState = sensorState;
+    //}
+    
+  //}
   else {
-    motor_drive(0, 0);
+    // --- MANUAL CONTROL MODE ---
+    // If data received within last 500ms, use Joystick. Otherwise, Stop.
+    if (millis() - lastRecvTime < 500) {
+       // Map Joystick (0-4095) to Motor Speed (-255 to 255)
+       // Adjust 1850-2250 to create a "deadzone" so it doesn't drift when idle
+       int joyY = map(incomingData.y, 0, 4095, 255, -255); // Y often needs inverting
+       int joyX = map(incomingData.x, 0, 4095, -255, 255);
+       
+       // Deadzone
+       if (abs(joyY) < 30) joyY = 0;
+       if (abs(joyX) < 30) joyX = 0;
+
+       // Mixing for Arcade Drive
+       int leftMotor = joyY + joyX;
+       int rightMotor = joyY - joyX;
+
+       // Constrain to max speed
+       leftMotor = constrain(leftMotor, -255, 255);
+       rightMotor = constrain(rightMotor, -255, 255);
+
+       motor_drive(leftMotor, rightMotor);
+       
+       // Handle Button Press (Example: Toggle Launcher)
+       if (incomingData.button == LOW) {
+          // Add action here if needed, e.g., digitalWrite(launcher, HIGH);
+       }
+    } 
+    else {
+      // No Joystick signal -> Stop motors
+      motor_drive(0, 0);
+    }
+    
+    // Keep your existing sensor logic running for updates
     int position = calculatePosition();
     if (prevsensorState != sensorState) {
       sendState(sensorState);
