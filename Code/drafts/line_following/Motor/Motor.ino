@@ -1,0 +1,548 @@
+#include <vector>
+#include <WiFi.h>
+#include <WiFiUdp.h>
+
+WiFiUDP udp;
+const char* laptop_ip = "172.20.10.3"; // Replace with your laptop's hotspot IP
+const int udp_port = 4210;
+
+// WiFi Credentials
+const char* ssid = "Kelson iPhone";     // Must match exactly
+const char* password = "kelson123";
+
+const int ain1Pin = 13;     // Left motor direction 1
+const int ain2Pin = 18;     // Left motor direction 2
+const int pwmA = 25;        // Left motor PWM
+const int LeftC1 = 4;      // Left motor C1
+const int LeftC2 = 5;      // Left motor C2
+const int RightC1 = 23;     // Right motor C1
+const int RightC2 = 22;     // Right motor C2
+const int bin1Pin = 14;     // Right motor direction 1
+const int bin2Pin = 27;     // Right motor direction 2
+const int pwmB = 26;        // Right motor PWM
+const int button = 19;       // Button
+const int launcher = 21;     // Launcher servo motor
+const int collector = 17;     // Collecter servo motor
+
+// --- IR Sensor Pins (TCRT5000 5-channel) ---
+const int sensorPins[5] = {39, 34, 35, 32, 33};  // Out1..Out5
+int sensorValues[5];
+int threshold[5];
+uint8_t sensorState = 0;
+uint8_t prevsensorState = 0;
+
+// --- PWM Configuration for ESP32-S3 ---
+const int PWM_FREQ = 20000;   // 20 kHz
+const int PWM_RES = 8;        // 8-bit (0-255)
+
+// PID constants (tuned for faster response)
+float Kp = 0.2;   // Proportional gain
+float Ki = 0.0;   // Integral gain
+float Kd = 0.23;  // Derivative gain
+
+long P, I, D, previousError = 0;
+int error = 0;
+int ExpSpeed = 50; // Exploration speed (increased for faster response)
+int speed = 150;    // Speed run speed
+const float motorBalance = 0.975; // Adjust if one motor is stronger (e.g., 0.95 for weaker right motor)
+
+// Communication
+String resp = ""; // Data received from Pi
+
+// State
+enum RobotState {
+  WAITING,            // Initial wait for Pi
+  START,              // Go through starting line
+  EXPLORATION,        // Mapping the maze
+  START_SPEED_RUN,    // Go through starting line
+  SPEED_RUN           // Following the optimized path
+};
+RobotState currentState = WAITING;    // Initial state
+
+// Junction 
+std::vector<char> path;  // Stores 'L', 'R', 'F'
+
+// Speed run
+int pathIndex = 0;
+int position = 0;
+
+// Mode
+bool start = false;
+
+void setup() {
+  // Serial Monitor
+  Serial.begin(115200);
+
+  // WiFi connect
+  WiFi.begin(ssid, password);
+  WiFi.setSleep(false);
+
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nConnected!");
+  send("Connected");
+  
+  // Motor pins
+  pinMode(ain1Pin, OUTPUT);
+  pinMode(ain2Pin, OUTPUT);
+  pinMode(bin1Pin, OUTPUT);
+  pinMode(bin2Pin, OUTPUT);
+  pinMode(LeftC1, INPUT);
+  pinMode(LeftC2, INPUT);
+  pinMode(RightC1, INPUT);
+  pinMode(RightC2, INPUT);
+  pinMode(launcher, OUTPUT);
+  pinMode(collector, OUTPUT);
+  pinMode(button, INPUT_PULLUP);
+
+  // Sensor pins
+  for (int i = 0; i < 5; i++) {
+    pinMode(sensorPins[i], INPUT);
+  }
+
+  // PWM setup
+  ledcAttach(pwmA, PWM_FREQ, PWM_RES);
+  ledcAttach(pwmB, PWM_FREQ, PWM_RES);
+
+  // Calibrate sensor thresholds
+  calibrateSensors();
+  Serial.println("Mode: Waiting");
+  send("Mode: Waiting");
+}
+
+void loop() {
+
+  if (digitalRead(button) == LOW) { 
+    while (digitalRead(button) == LOW) {
+      delay(1);
+    }
+
+    if (start) {
+      start = false;
+      send("Mode: wait");
+    }
+
+    else {
+      start = true;
+      send("Mode: start");
+    }
+  }
+
+  if (start) {
+    motor_drive(75, 75);
+
+  }
+
+  else {
+    motor_drive(0, 0);
+  }
+  
+}
+
+// --- Calibrate sensor thresholds ---
+void calibrateSensors() {
+  Serial.println("Calibrating sensors... Place robot on the line and wait.");
+  send("Calibrating sensors... Place robot on the line and wait.");
+  delay(2000); // Wait for placement
+  for (int i = 0; i < 5; i++) {
+    threshold[i] = 0.5 * 4095;
+  }
+  Serial.println("Calibration complete.");
+  send("Calibration complete.");
+}
+
+// --- Motor drive ---
+void motor_drive(int leftSpeed, int rightSpeed) {
+  // Left motor
+  if (leftSpeed <= 0) {
+    digitalWrite(ain1Pin, LOW);
+    digitalWrite(ain2Pin, HIGH);
+  } else {
+    digitalWrite(ain1Pin, HIGH);
+    digitalWrite(ain2Pin, LOW);
+  }
+  ledcWrite(pwmA, abs(leftSpeed * motorBalance));
+
+  // Right motor
+  if (rightSpeed <= 0) {
+    digitalWrite(bin1Pin, HIGH);
+    digitalWrite(bin2Pin, LOW);
+  } else {
+    digitalWrite(bin1Pin, LOW);
+    digitalWrite(bin2Pin, HIGH);
+  }
+  ledcWrite(pwmB, abs(rightSpeed));
+}
+
+// --- PID Control ---
+void PID_Linefollow(int error, int speed) {
+  P = error;
+  I += error;
+  I = constrain(I, -1000, 1000); // Prevent integral windup
+  D = error - previousError;
+
+  float PIDvalue = Kp * P + Ki * I + Kd * D;
+  previousError = error;
+
+  int lsp = speed - PIDvalue;
+  int rsp = (speed + PIDvalue);
+
+  lsp = constrain(lsp, -180, 180); // Allow reverse for sharper corrections
+  rsp = constrain(rsp, -180, 180);
+
+  motor_drive(lsp, rsp);
+}
+
+// --- Calculate line position + Update sensor state --- 
+int calculatePosition() { 
+  long weightedSum = 0;
+  long sum = 0;
+  static uint8_t lastRawState = 0;
+  static int consistencyCount = 0;
+  uint8_t currentRawState = 0; 
+
+  for (int i = 0; i < 5; i++) {
+    int val = analogRead(sensorPins[i]);
+    sensorValues[i] = val;
+
+    // 1. Binary Mapping (White Line = 1)
+    if (val > threshold[i]) {
+      currentRawState |= (1 << (4 - i));
+    }
+
+    // 2. Analog Weighting for PID (Invert so White Line has higher weight)
+    // map(value, fromLow, fromHigh, toLow, toHigh)
+    int weight = map(val, threshold[i], 4095, 0, 1000); 
+    weight = constrain(weight, 0, 1000);
+
+    if (weight > 100) { // Noise filter
+      weightedSum += (long)i * weight;
+      sum += weight;
+    }
+  }
+
+  if (currentRawState == lastRawState) {
+    // If the new reading matches the previous one, increase confidence
+    consistencyCount++;
+  } else {
+    // If it changed, reset the counter and update the "last" value
+    consistencyCount = 0;
+    lastRawState = currentRawState;
+  }
+
+  // Only update the global 'sensorState' if we have seen the same pattern
+  // 3 times in a row. (Adjust '3' to '5' if you need more stability)
+  if (consistencyCount >= 3) {
+    sensorState = currentRawState;
+  }
+
+  // Junction / dead end
+  if (sensorState == 0b00000 || sensorState == 0b11100 || sensorState == 0b00111 || sensorState == 0b11111) {
+    return -2; 
+  }
+
+  // Normal Line Following
+  if (sum == 0) {
+    return 2000; // Default to center if unsure
+  }
+
+  return ((weightedSum * 1000) / sum); // Result is 0 to 4000
+}
+
+// Check if receive message from Raspi
+String read() {
+  String data = Serial2.readStringUntil('\n');
+  data.trim();
+  Serial.print("Pi says: ");
+  Serial.println(data);
+  return data;
+}
+
+void send(String msg) {
+  udp.beginPacket(laptop_ip, udp_port);
+  udp.print(msg);
+  udp.endPacket();
+}
+
+unsigned long buttonCheck() {
+  unsigned long startTime = millis();
+  unsigned long duration = 0;
+  
+  Serial.println("Button is pressed");
+  send("Button is pressed");
+  
+  while (digitalRead(button) == LOW) {
+    duration = millis() - startTime;
+  }
+
+  Serial.print("Button is pressed for ");
+  Serial.println(duration);
+  send("Button is pressed for " + String(duration));
+  return duration;
+}
+
+char handleJunction() {
+  unsigned long startTime = millis();
+  unsigned long goalTime = 0;
+  bool canGoLeft = false;
+  bool canGoRight = false; 
+  
+  send("Start checking");
+  while (millis() - startTime < 80) {
+    motor_drive(ExpSpeed, ExpSpeed); // Keep moving forward
+    calculatePosition();
+    if (prevsensorState != sensorState) {
+        sendState(sensorState);
+        prevsensorState = sensorState;
+      }
+     
+    // Accumulate findings (Latch logic: Once true, stays true)
+    if ((sensorState & 0b10000)) canGoLeft = true;
+    if ((sensorState & 0b00001)) canGoRight = true;
+     
+    delay(1);
+  }
+  send("Finish checking");
+
+  if (sensorState == 0b11111) {
+      if (goalTime == 0) goalTime = millis(); // Start timer
+      if (millis() - goalTime > 100) {         // Check timer
+        motor_drive(0, 0);
+        send("Goal Reached (in Phase 1)!!");
+        start = false;
+        return 'N';
+      }
+  } else {
+      goalTime = 0; // Reset timer if signal breaks
+  }
+
+
+  while (!(sensorState == 0b01000 || sensorState == 0b00100 || sensorState == 0b00010 || sensorState == 0b00000)) {
+    delay(1);
+    position = calculatePosition();
+    if (prevsensorState != sensorState) {
+        sendState(sensorState);
+        prevsensorState = sensorState;
+      }
+    
+    if (sensorState == 0b11111) {
+      if (goalTime == 0) goalTime = millis(); // Start timer
+      if (millis() - goalTime > 50) {         // Check timer
+        motor_drive(0, 0);
+        send("Goal Reached (in Phase 1)!!");
+        start = false;
+        return 'N';
+      }
+    } else {
+       goalTime = 0; // Reset timer if signal breaks
+    }
+  }
+  
+  bool canGoForward = (sensorState & 0b01110); 
+
+  send("Junction: " + String(canGoLeft) + " " + String(canGoForward) + " " + String(canGoRight));
+  if (canGoLeft) {
+    Serial.println("Turn Left");
+    send("Turn Left");
+    return 'L';
+  } 
+  else if (canGoForward) {
+    Serial.println("Move Forward");
+    send("Move Forward");
+    return 'F';
+  } 
+  else if (canGoRight) {
+    Serial.println("Turn Right");
+    send("Turn Right");
+    return 'R';
+  } 
+  else {
+    Serial.println("U Turn");
+    send("U Turn");
+    return 'B';
+  }
+}
+
+void simplifyPath() {
+  int n = path.size();
+  if (n < 3 || path[n-2] != 'B') return;
+
+  char dir1 = path[n-3]; // Move before the dead end
+  char dir2 = path[n-1]; // Move after the dead end
+  char newDir = ' ';
+
+  // Simplified Logic Table:
+  if (dir1 == 'L' && dir2 == 'R') newDir = 'B';
+  else if (dir1 == 'L' && dir2 == 'F') newDir = 'R';
+  else if (dir1 == 'L' && dir2 == 'L') newDir = 'F';
+  else if (dir1 == 'F' && dir2 == 'R') newDir = 'L';
+  else if (dir1 == 'F' && dir2 == 'F') newDir = 'B';
+  else if (dir1 == 'F' && dir2 == 'L') newDir = 'R';
+  else if (dir1 == 'R' && dir2 == 'R') newDir = 'F';
+  else if (dir1 == 'R' && dir2 == 'F') newDir = 'L';
+  else if (dir1 == 'R' && dir2 == 'L') newDir = 'B';
+
+  // Remove the 3 bad moves and push the 1 correct move
+  if (newDir != ' ') {
+      path.pop_back(); // Remove dir2
+      path.pop_back(); // Remove 'B'
+      path.pop_back(); // Remove dir1
+      path.push_back(newDir);
+  }
+}
+
+void turn(char move) {
+  if (move == 'L') {
+    Serial.println("Turning Left");
+    send("Turning Left");
+    while (true) {
+      calculatePosition();
+      if (prevsensorState != sensorState) {
+        sendState(sensorState);
+        prevsensorState = sensorState;
+      }
+      motor_drive(-100, 100);
+      if ((sensorState & 0b10000) != 0) {
+        break;
+      }
+    }
+
+    while (true) {
+      calculatePosition();
+      if (prevsensorState != sensorState) {
+        sendState(sensorState);
+        prevsensorState = sensorState;
+      }
+      motor_drive(-50, 50);
+      if (sensorState == 0b00100) {
+        break;
+      }
+    }
+
+    Serial.println("Completed");
+    send("Completed");
+    motor_drive(0, 0);
+  }
+
+  else if (move == 'R') {
+    Serial.println("Turning Right");
+    send("Turning Right");
+    while (true) {
+      calculatePosition();
+      if (prevsensorState != sensorState) {
+        sendState(sensorState);
+        prevsensorState = sensorState;
+      }
+      motor_drive(100, -100);
+      if ((sensorState & 0b00001) != 0) {
+        break;
+      }
+    }
+
+    while (true) {
+      calculatePosition();
+      if (prevsensorState != sensorState) {
+        sendState(sensorState);
+        prevsensorState = sensorState;
+      }
+      motor_drive(50, -50);
+      if (sensorState == 0b00100) {
+        break;
+      }
+    }
+
+    Serial.println("Completed");
+    send("Completed");
+    motor_drive(0, 0);
+  }
+
+  else if (move == 'F') {
+    Serial.println("Move Forward (Do nothing)");
+    send("Move Forward (Do nothing)");
+    return;
+  }
+
+  else if (move == 'B') {
+    Serial.println("U turning");
+    send("U turning");
+    while (true) {
+      calculatePosition();
+      if (prevsensorState != sensorState) {
+        sendState(sensorState);
+        prevsensorState = sensorState;
+      }
+      motor_drive(-50, -50);
+      if ((sensorState & 0b01110) != 0) {
+        break;
+      }
+    }
+
+    unsigned long startTime = millis();
+
+    while (true) {
+      if (millis() - startTime > 1500) {
+        motor_drive(-50, 50);
+        delay(100);
+        motor_drive(-50, -50);
+        delay(100);
+        startTime = millis();
+      }
+
+      calculatePosition();
+      if (prevsensorState != sensorState) {
+        sendState(sensorState);
+        prevsensorState = sensorState;
+      }
+      motor_drive(100, -100);
+      if ((sensorState & 0b00001) != 0) {
+        break;
+      }
+    }
+
+    startTime = millis();
+
+    while (true) {
+      if (millis() - startTime > 3000) {
+        motor_drive(-50, 50);
+        delay(50);
+        motor_drive(-50, -50);
+        delay(100);
+        startTime = millis();
+      }
+
+      calculatePosition();
+      if (prevsensorState != sensorState) {
+        sendState(sensorState);
+        prevsensorState = sensorState;
+      }
+      motor_drive(50, -50);
+      if (sensorState == 0b00100) {
+        break;
+      }
+    }
+
+    Serial.println("Completed");
+    send("Completed");
+    motor_drive(0, 0);
+  }
+}
+
+void sendState(uint8_t msg) {
+  String binaryMessage = "";
+  
+  // Loop through 5 bits (from 4 down to 0)
+  for (int i = 4; i >= 0; i--) {
+    // Check if the i-th bit is set
+    if (msg & (1 << i)) {
+      binaryMessage += "1";
+    } else {
+      binaryMessage += "0";
+    }
+  }
+
+  send("sensorState: " + String(binaryMessage));
+}
