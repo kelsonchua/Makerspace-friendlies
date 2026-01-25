@@ -1,13 +1,11 @@
-An competition with incredible team Starks Legacy and the teamates below:
 
-Kelson Chua Wang Yan
+  # Horizontal Phone Page Design
 
-Loh Zhe Hong
+  This is a code bundle for Horizontal Phone Page Design. The original project is available at https://www.figma.com/design/yMfxpML1gBfHBvfUNI3Bu1/Horizontal-Phone-Page-Design.
 
-Tan Pei Yu
+  ## Running the code
 
-Alphonsus Ng Zu Ying
+  Run `npm i` to install the dependencies.
 
-Hong Keng Seng
-
-We won the competition with 1st place and is the only team solve the maze.
+  Run `npm run dev` to start the development server.
+  
